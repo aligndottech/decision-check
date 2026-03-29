@@ -13,6 +13,11 @@ When a developer opens or updates a PR, this action:
 
 No GitHub App installation required - just two secrets and a workflow file.
 
+## Distribution
+
+This action is published at [github.com/aligndottech/decision-check](https://github.com/aligndottech/decision-check).
+
+
 ## Setup
 
 ### 1. Get your credentials
@@ -176,6 +181,10 @@ The action needs these GitHub token permissions:
 - `checks: write` - to create check runs on the PR
 - `pull-requests: read` - to read PR diff and metadata
 - `contents: read` - to access repository content
+
+## Limitations
+
+**Fork PRs**: GitHub does not expose repository secrets to workflows triggered by `pull_request` events from forks. The action will fail with a missing API key error on fork PRs. This is a GitHub security feature and applies to all actions that use secrets. For open-source repos accepting external contributions, consider using the Align GitHub App instead, which runs on Align's infrastructure and doesn't depend on the contributor's workflow context.
 
 ## Troubleshooting
 
