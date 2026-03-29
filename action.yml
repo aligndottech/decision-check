@@ -1,0 +1,34 @@
+name: 'Align Decision Check'
+description: 'Check PR alignment against your team decisions tracked in Align'
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+inputs:
+  align-api-key:
+    description: 'Align API key for authentication'
+    required: true
+  align-tenant-id:
+    description: 'Align tenant ID'
+    required: true
+  align-api-url:
+    description: 'Align API URL'
+    required: false
+    default: 'https://api.align.tech'
+  fail-on:
+    description: 'When to fail: "critical" (default), "any", or "none"'
+    required: false
+    default: 'critical'
+  github-token:
+    description: 'GitHub token for creating check runs'
+    required: false
+    default: ${{ github.token }}
+outputs:
+  status:
+    description: 'Alignment status: aligned, conflicting, or no-context'
+  conflicts-count:
+    description: 'Number of conflicts found'
+  critical-count:
+    description: 'Number of critical conflicts'
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
