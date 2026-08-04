@@ -17,6 +17,7 @@ No GitHub App installation required - just two secrets and a workflow file.
 
 This action is published at [github.com/aligndottech/decision-check](https://github.com/aligndottech/decision-check).
 
+> **Internal note**: The source lives in `align-stack/actions/decision-check/`. On release, the built `dist/index.js`, `action.yml`, and `README.md` are copied to the public `aligndottech/decision-check` repo and tagged. See the release workflow for details.
 
 ## Setup
 
