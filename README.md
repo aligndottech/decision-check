@@ -17,7 +17,17 @@ No GitHub App installation required - just two secrets and a workflow file.
 
 This action is published at [github.com/aligndottech/decision-check](https://github.com/aligndottech/decision-check).
 
-> **Internal note**: The source lives in `align-stack/actions/decision-check/`. On release, the built `dist/index.js`, `action.yml`, and `README.md` are copied to the public `aligndottech/decision-check` repo and tagged. See the release workflow for details.
+### `@v1` or a pinned SHA?
+
+`v1` is a **moving major tag**: it is re-pointed at each 1.x release, so you pick up fixes without doing anything. That is the recommended default, and it is deliberate. This action's job is to be honest about its own degradation, and the failure mode of pinning is that a fix to exactly that behaviour never reaches you - which is how a build that reported success when the analysis service was unreachable stayed on this tag from 2026-03-29 to 2026-08-04.
+
+```yaml
+uses: aligndottech/decision-check@v1                        # recommended: gets fixes
+uses: aligndottech/decision-check@81edf6a218d73963c4b340b2b4e40c21a785bd86   # pinned: fully reproducible
+```
+
+Pin a SHA if your supply-chain policy requires that no third-party action can change under you between runs. If you do, put the bump on whatever cadence you already use for dependency review - a pinned action never updates itself.
+
 
 ## Setup
 
@@ -77,7 +87,7 @@ That's it. Every PR now gets checked against your team's decisions.
 
 | Output | Description |
 |--------|-------------|
-| `status` | Alignment status: `aligned`, `conflicting`, or `no-context` |
+| `status` | Alignment status: `aligned`, `conflicting`, `no-context`, or `unknown` (the check could not run - see below) |
 | `conflicts-count` | Total number of conflicts found |
 | `critical-count` | Number of critical conflicts |
 
@@ -164,6 +174,21 @@ The action creates a GitHub check run called "Align Decision Check":
 | **Pass** | PR aligns with tracked decisions. Shows related decisions with match percentages. |
 | **Neutral** | No relevant decisions found, or conflicts are below your `fail-on` threshold. |
 | **Fail** | PR conflicts with tracked decisions. Shows conflict details, severity, and suggested resolutions. |
+| **Neutral, titled "could not run"** | The check did not complete. This is **not** a pass - see below. |
+
+## When the check cannot run
+
+A check that reports success when it never ran is worse than no check, so this action never does that. Three things can stop it completing, and all three produce the **same neutral check run titled "Alignment check could not run", whose summary says "This is not a pass"**:
+
+| What happened | What you see |
+|---|---|
+| Align reached the API, but its analysis service was degraded | `status` output is `unknown`. The step does **not** fail: your install is fine and the outage is not a conflict. |
+| The API was unreachable, returned an error, timed out (120s ceiling), or answered with something unparseable | `status` output is `unknown`, and the summary names the underlying error. The step **fails**, unless `fail-on: none`. |
+| The API answered with a status this action does not recognise | Same as above. |
+
+The distinction in the second row is deliberate. A degraded backend is Align's problem and should not block your PR. An unreachable API is indistinguishable from a broken install - a wrong `align-api-url`, a revoked key, a tenant mismatch - and a broken install that quietly goes green is exactly the failure this action exists to avoid. Set `fail-on: none` if you want the action purely advisory; the neutral record is still written either way.
+
+**If you make this check required**, note that a run cannot report at all if the job itself never starts (for example, on a fork PR with no secrets - see Limitations). A required check that never reports leaves the PR pending, not passing.
 
 ## How It Differs from the Align GitHub App
 

@@ -12,10 +12,6 @@ var __commonJS = (cb, mod) => function __require() {
     throw mod = 0, e;
   }
 };
-var __export = (target, all) => {
-  for (var name in all)
-    __defProp(target, name, { get: all[name], enumerable: true });
-};
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
     for (let key of __getOwnPropNames(from))
@@ -32,7 +28,6 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
   mod
 ));
-var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // ../../node_modules/.pnpm/tunnel@0.0.6/node_modules/tunnel/lib/tunnel.js
 var require_tunnel = __commonJS({
@@ -19618,13 +19613,6 @@ var require_fast_content_type_parse = __commonJS({
   }
 });
 
-// src/main.ts
-var main_exports = {};
-__export(main_exports, {
-  run: () => run
-});
-module.exports = __toCommonJS(main_exports);
-
 // ../../node_modules/.pnpm/@actions+core@3.0.1/node_modules/@actions/core/lib/command.js
 var os = __toESM(require("os"), 1);
 
@@ -23862,6 +23850,7 @@ function getOctokit(token, options, ...additionalPlugins) {
 // src/align-client.ts
 var MAX_CONTENT_LENGTH = 8e3;
 var TRUNCATION_NOTE = "\n\n[truncated - diff exceeded 8000 character limit]";
+var DEFAULT_TIMEOUT_MS = 12e4;
 async function checkAlignment(opts) {
   let content = opts.content;
   if (content.length > MAX_CONTENT_LENGTH) {
@@ -23872,15 +23861,25 @@ async function checkAlignment(opts) {
     content,
     context: opts.context
   };
-  const response = await fetch(`${opts.apiUrl}/alignment/check`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${opts.apiKey}`,
-      "x-tenant-id": opts.tenantId
-    },
-    body: JSON.stringify(body)
-  });
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  let response;
+  try {
+    response = await fetch(`${opts.apiUrl}/alignment/check`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${opts.apiKey}`,
+        "x-tenant-id": opts.tenantId
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+  } catch (error2) {
+    if (error2?.name === "TimeoutError") {
+      throw new Error(`Align API request timed out after ${timeoutMs}ms`);
+    }
+    throw error2;
+  }
   if (!response.ok) {
     throw new Error(`Align API error: ${response.status} ${response.statusText}`);
   }
@@ -23926,6 +23925,15 @@ ${f.patch}` : header;
 }
 
 // src/check-run.ts
+function couldNotRun(title, detail) {
+  return {
+    conclusion: "neutral",
+    title,
+    summary: `${detail}
+
+This is not a pass - review the change against relevant decisions manually, or re-run the check.`
+  };
+}
 function formatCheckOutput(response) {
   if (response.status === "no-context") {
     return {
@@ -23946,13 +23954,17 @@ ${decisionList || "None"}`
     };
   }
   if (response.status === "unknown") {
-    return {
-      conclusion: "neutral",
-      title: "Alignment check could not run (analysis service unavailable)",
-      summary: `${response.message}
-
-This is not a pass - review the change against relevant decisions manually, or re-run the check.`
-    };
+    const skipped = response.reason === "not_adjudicated" || response.reason === "unclassified_relation" || response.reason === "low_confidence_conflict";
+    return couldNotRun(
+      skipped ? "Alignment check did not adjudicate this change" : "Alignment check could not run (analysis service unavailable)",
+      response.message
+    );
+  }
+  if (response.status !== "conflicting") {
+    return couldNotRun(
+      "Alignment check could not run (unrecognised response)",
+      response.message ?? (typeof response.status === "string" ? `The Align API returned a status this action does not understand: ${response.status}.` : "The Align API response carried no status field.")
+    );
   }
   const conflicts = response.conflicts ?? [];
   const critical = conflicts.filter((c) => c.severity === "critical");
@@ -24029,7 +24041,22 @@ async function run(deps) {
       );
     }
   } catch (error2) {
-    deps.setFailed(error2.message ?? "Unknown error during alignment check");
+    const detail = error2?.message ?? "Unknown error during alignment check";
+    try {
+      await deps.createCheckRun(
+        couldNotRun(
+          "Alignment check could not run",
+          `The alignment check could not be completed: ${detail}`
+        )
+      );
+    } catch {
+    }
+    deps.setOutput("status", "unknown");
+    deps.setOutput("conflicts-count", "0");
+    deps.setOutput("critical-count", "0");
+    if (inputs.failOn !== "none") {
+      deps.setFailed(detail);
+    }
   }
 }
 async function main() {
@@ -24079,12 +24106,10 @@ async function main() {
     setFailed
   });
 }
-if (process.env.GITHUB_ACTIONS) {
-  main();
-}
-// Annotate the CommonJS export names for ESM import in node:
-0 && (module.exports = {
-  run
+
+// src/index.ts
+void main().catch((err) => {
+  setFailed(err instanceof Error ? err.message : String(err));
 });
 /*! Bundled license information:
 
