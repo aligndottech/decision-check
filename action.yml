@@ -24,7 +24,7 @@ inputs:
     default: ${{ github.token }}
 outputs:
   status:
-    description: 'Alignment status: aligned, conflicting, or no-context'
+    description: 'Alignment status: aligned, conflicting, no-context, or unknown (the check could not run - never treat as a pass)'
   conflicts-count:
     description: 'Number of conflicts found'
   critical-count:
