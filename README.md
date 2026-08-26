@@ -1,223 +1,151 @@
 # Align Decision Check
 
-A GitHub Action that checks PR alignment against your team's decisions tracked in [Align](https://align.tech). Add it to your CI pipeline to catch decision drift before it ships.
+Check a pull request against your team's decision graph, and fail the build when it
+contradicts a decision someone already made.
 
-## What It Does
+Works with Align cloud or a self-hosted gateway. **The check runs entirely from the CLI, so
+GitHub Actions is a convenience, not a requirement** - see [Other CI systems](#other-ci-systems).
 
-When a developer opens or updates a PR, this action:
-
-1. Extracts the PR diff (title, description, changed files, patches)
-2. Sends it to the Align API for analysis against your tracked decisions
-3. Creates a GitHub check run showing the results (aligned, conflicts, or no relevant decisions)
-4. Optionally fails the CI pipeline if conflicts exceed your threshold
-
-No GitHub App installation required - just two secrets and a workflow file.
-
-## Distribution
-
-This action is published at [github.com/aligndottech/decision-check](https://github.com/aligndottech/decision-check).
-
-### `@v1` or a pinned SHA?
-
-`v1` is a **moving major tag**: it is re-pointed at each 1.x release, so you pick up fixes without doing anything. That is the recommended default, and it is deliberate. This action's job is to be honest about its own degradation, and the failure mode of pinning is that a fix to exactly that behaviour never reaches you - which is how a build that reported success when the analysis service was unreachable stayed on this tag from 2026-03-29 to 2026-08-04.
+## GitHub Actions
 
 ```yaml
-uses: aligndottech/decision-check@v1                        # recommended: gets fixes
-uses: aligndottech/decision-check@81edf6a218d73963c4b340b2b4e40c21a785bd86   # pinned: fully reproducible
-```
-
-Pin a SHA if your supply-chain policy requires that no third-party action can change under you between runs. If you do, put the bump on whatever cadence you already use for dependency review - a pinned action never updates itself.
-
-
-## Setup
-
-### 1. Get your credentials
-
-In [Align](https://app.align.tech), go to **Settings > API Keys**:
-- Generate an **API key**
-- Copy your **Tenant ID**
-
-### 2. Add secrets to your repo
-
-In your GitHub repo, go to **Settings > Secrets and variables > Actions** and add:
-
-| Secret | Value |
-|--------|-------|
-| `ALIGN_API_KEY` | Your Align API key |
-| `ALIGN_TENANT_ID` | Your Align tenant ID |
-
-### 3. Add the workflow
-
-Create `.github/workflows/decision-check.yml`:
-
-```yaml
-name: Decision Check
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-permissions:
-  checks: write
-  pull-requests: read
-  contents: read
+name: Align
+on: pull_request
 
 jobs:
-  check-alignment:
+  align:
     runs-on: ubuntu-latest
     steps:
-      - uses: aligndottech/decision-check@v1
+      - uses: actions/checkout@v5
         with:
-          align-api-key: ${{ secrets.ALIGN_API_KEY }}
-          align-tenant-id: ${{ secrets.ALIGN_TENANT_ID }}
+          fetch-depth: 0          # recommended; the action will deepen if you forget
+      - uses: aligndottech/decision-check@v2@main
+        with:
+          token: ${{ secrets.ALIGN_TOKEN }}
 ```
 
-That's it. Every PR now gets checked against your team's decisions.
+### Self-hosted
 
-## Inputs
-
-| Input | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `align-api-key` | Yes | - | Align API key for authentication |
-| `align-tenant-id` | Yes | - | Your Align tenant ID |
-| `align-api-url` | No | `https://api.align.tech` | Align API URL (override for self-hosted) |
-| `fail-on` | No | `critical` | When to fail: `critical`, `any`, or `none` |
-| `github-token` | No | `${{ github.token }}` | GitHub token for creating check runs |
-
-## Outputs
-
-| Output | Description |
-|--------|-------------|
-| `status` | Alignment status: `aligned`, `conflicting`, `no-context`, or `unknown` (the check could not run - see below) |
-| `conflicts-count` | Total number of conflicts found |
-| `critical-count` | Number of critical conflicts |
-
-## Configuration Examples
-
-### Fail only on critical conflicts (default)
-
-The action fails the check only when a PR directly contradicts a decision with high confidence.
-Warnings are reported but don't block the PR.
+Point it at your own gateway. Nothing else changes.
 
 ```yaml
-- uses: aligndottech/decision-check@v1
-  with:
-    align-api-key: ${{ secrets.ALIGN_API_KEY }}
-    align-tenant-id: ${{ secrets.ALIGN_TENANT_ID }}
-    fail-on: critical
+      - uses: aligndottech/decision-check@v2@main
+        with:
+          gateway-url: https://align.internal.example.com
+          token: ${{ secrets.ALIGN_TOKEN }}
+          tenant-id: ${{ vars.ALIGN_TENANT_ID }}
 ```
 
-### Fail on any conflict
+### Inputs
 
-Stricter mode - any conflict (including warnings) fails the check.
+| Input | Default | Purpose |
+| -- | -- | -- |
+| `token` | - | Align API token. Store as a secret. |
+| `tenant-id` | - | Only needed when the token does not identify the tenant. |
+| `gateway-url` | Align cloud | Your gateway's base URL, for self-hosting. |
+| `env` | `prod` | Align cloud environment, when `gateway-url` is unset. |
+| `base-ref` | PR base, else default branch | What to diff against. |
+| `fail-on` | `conflict` | `conflict`, `conflict-or-unknown`, or `never`. |
+| `cli-version` | `latest` | Version of `@aligndottech/cli` to run. Pin it to an exact version for reproducible builds. |
+| `working-directory` | `.` | Directory to run in. |
+
+Outputs: `status` (`aligned` / `conflicting` / `unknown` / `error`) and `result` (the raw JSON).
+
+## What it diffs, and why that matters
+
+The check analyses `git diff <base>...HEAD` - three dots, so it starts from the **merge base**
+and contains only the commits on your branch. Two dots would also sweep in everything that
+landed on the base since you branched, which means a long-lived branch could be failed by a
+conflict it did not introduce.
+
+This is also why a base ref is mandatory in CI. A CI checkout has a clean working tree, so
+`git diff` and `git diff --staged` are both empty: a pipeline that runs `align check` without
+a base checks nothing and passes every time. The action always passes `--base`.
+
+## Exit codes and `fail-on`
+
+The CLI distinguishes four outcomes, and the distinction is the point:
+
+| Exit | Status | Meaning |
+| -- | -- | -- |
+| `0` | `aligned` | Checked, related decisions found, none oppose the diff. |
+| `0` | `no-context` | Checked, no related decisions found. A result, not a failure. |
+| `1` | `conflicting` | Checked, conflicts with a recorded decision. |
+| `2` | `unknown` | **Could not check.** Not a pass. |
+
+`no-context` and `unknown` are the pair most easily confused, and folding them together is a
+real defect rather than a wording nit: `no-context` means the check ran and the graph had
+nothing to say, which is the ordinary outcome for new work. `unknown` means it did not run.
+Treating the first as the second made `conflict-or-unknown` block every PR whose diff had no
+related decisions, in a repo where that check was required (align-stack#1482).
+
+A conflict is only ever reported when the CLI actually says `conflicting`. If it crashes -
+an old version, a bad flag, a runtime error - it also exits `1`, but with no result to
+parse, and the action treats that as **could not check**, never as a finding. Reporting a
+crash as a conflict would be inventing a result.
+
+`fail-on: conflict` (the default) fails only on a real conflict, and warns when the check
+did not complete. That is deliberate: a required status check that fails when the service is
+unreachable turns every outage into a repository-wide merge freeze. If you would rather
+block than merge unchecked, use `fail-on: conflict-or-unknown`.
+
+The policy is a small script, `decide.sh`, covered by a truth table in
+`src/__tests__/action-decide.test.ts`.
+
+Set `fail-on: never` to report into the job summary without ever failing - a good way to
+watch the signal before you make the check required.
+
+## Making it a required check
+
+Add the job, let it run on a few PRs, and only then mark it required in your branch
+protection ruleset. A required check that has never reported blocks every pull request
+indefinitely, because GitHub has no timeout for a status that never arrives.
+
+## Requirements
+
+`--base` ships in the first `@aligndottech/cli` release after `0.8.1`, which is why
+`cli-version` defaults to `latest`. Pin it to an exact version once that release is
+published.
+
+## Other CI systems
+
+The action is a thin wrapper. Any CI that can run Node can run the check directly:
+
+```bash
+npx @aligndottech/cli check --ci --base "origin/$CI_TARGET_BRANCH"
+```
+
+Configure it with environment variables:
+
+| Variable | Purpose |
+| -- | -- |
+| `ALIGN_TOKEN` | API token |
+| `ALIGN_TENANT_ID` | Tenant, when the token does not imply one |
+| `ALIGN_GATEWAY_URL` | Self-hosted gateway base URL |
+| `ALIGN_ENV` | `prod`, `preview` or `local` for Align cloud |
+
+GitLab CI:
 
 ```yaml
-- uses: aligndottech/decision-check@v1
-  with:
-    align-api-key: ${{ secrets.ALIGN_API_KEY }}
-    align-tenant-id: ${{ secrets.ALIGN_TENANT_ID }}
-    fail-on: any
+align:
+  image: node:22
+  script:
+    - git fetch --no-tags origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - npx @aligndottech/cli check --ci --base "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+  variables:
+    ALIGN_TOKEN: $ALIGN_TOKEN
 ```
 
-### Report only (never fail)
+The command prints one line of JSON to stdout, so any runner can branch on the exit code or
+parse the result:
 
-Shows results in the check run but never blocks the PR. Good for rollout.
+| Exit | Meaning |
+|------|---------|
+| `0` | The check ran and nothing opposes the diff (`aligned` or `no-context`). |
+| `1` | A conflict was found. |
+| `2` | The check could not run - `unknown` (the graph could not classify) or `error` (the gateway was unreachable, the token was rejected, the base ref was bad). **Not a pass.** |
 
-```yaml
-- uses: aligndottech/decision-check@v1
-  with:
-    align-api-key: ${{ secrets.ALIGN_API_KEY }}
-    align-tenant-id: ${{ secrets.ALIGN_TENANT_ID }}
-    fail-on: none
-```
-
-### Use outputs in follow-up steps
-
-```yaml
-- uses: aligndottech/decision-check@v1
-  id: decision-check
-  with:
-    align-api-key: ${{ secrets.ALIGN_API_KEY }}
-    align-tenant-id: ${{ secrets.ALIGN_TENANT_ID }}
-    fail-on: none
-
-- name: Comment on PR if conflicts found
-  if: steps.decision-check.outputs.conflicts-count != '0'
-  uses: actions/github-script@v7
-  with:
-    script: |
-      github.rest.issues.createComment({
-        owner: context.repo.owner,
-        repo: context.repo.repo,
-        issue_number: context.issue.number,
-        body: `Decision check found ${{ steps.decision-check.outputs.conflicts-count }} conflict(s). Review the check run for details.`
-      })
-```
-
-### Self-hosted Align
-
-If you're running Align on your own infrastructure:
-
-```yaml
-- uses: aligndottech/decision-check@v1
-  with:
-    align-api-key: ${{ secrets.ALIGN_API_KEY }}
-    align-tenant-id: ${{ secrets.ALIGN_TENANT_ID }}
-    align-api-url: https://api.align.yourcompany.com
-```
-
-## Check Run Results
-
-The action creates a GitHub check run called "Align Decision Check":
-
-| Result | Meaning |
-|--------|---------|
-| **Pass** | PR aligns with tracked decisions. Shows related decisions with match percentages. |
-| **Neutral** | No relevant decisions found, or conflicts are below your `fail-on` threshold. |
-| **Fail** | PR conflicts with tracked decisions. Shows conflict details, severity, and suggested resolutions. |
-| **Neutral, titled "could not run"** | The check did not complete. This is **not** a pass - see below. |
-
-## When the check cannot run
-
-A check that reports success when it never ran is worse than no check, so this action never does that. Three things can stop it completing, and all three produce the **same neutral check run titled "Alignment check could not run", whose summary says "This is not a pass"**:
-
-| What happened | What you see |
-|---|---|
-| Align reached the API, but its analysis service was degraded | `status` output is `unknown`. The step does **not** fail: your install is fine and the outage is not a conflict. |
-| The API was unreachable, returned an error, timed out (120s ceiling), or answered with something unparseable | `status` output is `unknown`, and the summary names the underlying error. The step **fails**, unless `fail-on: none`. |
-| The API answered with a status this action does not recognise | Same as above. |
-
-The distinction in the second row is deliberate. A degraded backend is Align's problem and should not block your PR. An unreachable API is indistinguishable from a broken install - a wrong `align-api-url`, a revoked key, a tenant mismatch - and a broken install that quietly goes green is exactly the failure this action exists to avoid. Set `fail-on: none` if you want the action purely advisory; the neutral record is still written either way.
-
-**If you make this check required**, note that a run cannot report at all if the job itself never starts (for example, on a fork PR with no secrets - see Limitations). A required check that never reports leaves the PR pending, not passing.
-
-## How It Differs from the Align GitHub App
-
-| | Decision Check (this action) | Align GitHub App |
-|---|---|---|
-| **Install** | Workflow file + 2 secrets | GitHub App install (org admin) |
-| **Scope** | PR alignment checking only | Full integration: decision capture, PR linking, bidirectional sync |
-| **Runs on** | Your CI runner | Align's infrastructure |
-| **Best for** | Quick adoption, specific repos | Organization-wide deep integration |
-
-Both can coexist - use this action on repos that aren't connected to the GitHub App yet.
-
-## Permissions
-
-The action needs these GitHub token permissions:
-- `checks: write` - to create check runs on the PR
-- `pull-requests: read` - to read PR diff and metadata
-- `contents: read` - to access repository content
-
-## Limitations
-
-**Fork PRs**: GitHub does not expose repository secrets to workflows triggered by `pull_request` events from forks. The action will fail with a missing API key error on fork PRs. This is a GitHub security feature and applies to all actions that use secrets. For open-source repos accepting external contributions, consider using the Align GitHub App instead, which runs on Align's infrastructure and doesn't depend on the contributor's workflow context.
-
-## Troubleshooting
-
-**"Align API error: 401 Unauthorized"** - Check that `ALIGN_API_KEY` is correct and not expired.
-
-**"Align API error: 403 Forbidden"** - Check that `ALIGN_TENANT_ID` matches the tenant the API key belongs to.
-
-**"This action only works on pull_request events"** - The action must be triggered by `pull_request` events. Check your workflow `on:` trigger.
-
-**Check run shows "No relevant decisions"** - Your Align tenant may not have decisions tracked yet, or the PR doesn't relate to any tracked decisions.
+Treat `2` as you would a failed build step, or explicitly allow it if you would rather an
+Align outage never blocked your pipeline. What you must not do is treat it as success:
+before CLI 0.18.0 a transport failure exited `0`, so a runner branching on the code read an
+outage as a clean check.
